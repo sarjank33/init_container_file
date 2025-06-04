@@ -1,0 +1,200 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-subscriptions-ms
+  namespace: {{.Values.namespace}}
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: core-subscriptions-ms
+  replicas: {{.Values.replicas}}
+  template: # create pods using pod definition in this template
+    metadata:
+      namespace: {{.Values.namespace}}
+      labels:
+        app: core-subscriptions-ms
+    spec:
+      ### serviceAccountName: migration-tracker  # ADD THIS LINE
+      # ONLY ADD THIS SECTION - everything else stays the same
+      initContainers:
+        - name: run-migration
+          image: {{.Values.core_subscriptions_ms.image}}
+          command:
+            - sh
+            - -c
+            - |
+              echo "🚀 Smart migration check for core-subscriptions-ms..."
+              echo "Version: {{.Values.core_subscriptions_ms.version}}"
+              
+              # Method 1: Check if migrations are up to date using your migration tool
+              echo "🔍 Checking migration status..."
+              
+              # Most migration tools have a way to check if migrations are up to date
+              # Adjust this command based on your specific migration tool
+              if npm run subscriptions:migration:status 2>/dev/null | grep -qi "up.to.date\|current\|no.pending\|already.applied\|nothing.to.migrate"; then
+                echo "✅ Database migrations are up to date"
+                echo "🔄 Skipping migration - this is likely a pod restart/scale"
+                exit 0
+              fi
+              
+              # Method 2: Check for pending migrations
+              echo "🔍 Checking for pending migrations..."
+              
+              # Try to list pending migrations (adjust command as needed)
+              PENDING=$(npm run subscriptions:migration:pending 2>/dev/null || echo "")
+              
+              if [ -z "$PENDING" ] || echo "$PENDING" | grep -qi "no.pending\|up.to.date\|none"; then
+                echo "✅ No pending migrations found"
+                echo "🔄 Skipping migration - database is current"
+                exit 0
+              fi
+              
+              echo "🆕 Pending migrations detected - running migration..."
+              
+              # Run migration
+              npm run subscriptions:migration:up || {
+                echo "❌ Migration failed!"
+                exit 1
+              }
+              
+              # Verify migration completed
+              echo "✅ Migration completed! Verifying..."
+              npm run subscriptions:migration:status || echo "⚠️ Could not verify status"
+              
+              echo "🎉 Migration process finished successfully!"
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=2048"
+          envFrom:
+            - configMapRef:
+                name: common-configmap
+            - configMapRef:
+                name: core-subscriptions-ms-configmap
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              memory: "3Gi"
+              cpu: "1500m"
+      #  END OF NEW SECTION
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        # whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: core-subscriptions-ms
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: core-subscriptions-ms
+      containers:
+        - name: core-subscriptions-ms
+          env:
+            - name: "AWS_TEST_ACCESS_KEY_ID"
+              valueFrom:
+                secretKeyRef:
+                  key:  AWS_TEST_ACCESS_KEY_ID
+                  name: secrets
+            - name: "AWS_TEST_SECRET_ACCESS_KEY"
+              valueFrom:
+                secretKeyRef:
+                  key:  AWS_TEST_SECRET_ACCESS_KEY
+                  name: secrets
+            - name: "PREFIX"
+              value: "core-events"
+          envFrom:
+            - configMapRef:
+                name: common-configmap
+            - configMapRef:
+                name: core-subscriptions-ms-configmap
+          image: {{.Values.core_subscriptions_ms.image}}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          # volumeMounts:
+          #   - name: efs-store
+          #     mountPath: /tmp/data
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "250m"
+            limits:
+              memory: "1200Mi"
+              cpu: "300m"           
+          ## livenessProbe:
+          #   httpGet:
+          #     path: /subscriptions/healthcheck
+          #     port: 80
+          #   initialDelaySeconds: 30
+          #   timeoutSeconds: 10
+          #   periodSeconds: 30
+          #   failureThreshold: 6
+          # readinessProbe:
+          #   httpGet:
+          #     path: /subscriptions/healthcheck
+          #     port: 80
+          #   initialDelaySeconds: 15
+          #   timeoutSeconds: 5
+          #   periodSeconds: 15
+          #   failureThreshold: 6
+      # volumes:
+      #   - name: efs-store
+      #     persistentVolumeClaim:
+      #       claimName: efs-claim
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{.Values.namespace}}
+  name: core-subscriptions-ms
+spec:
+  selector:
+    app: core-subscriptions-ms
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+  type: NodePort
+---              
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: core-subscriptions-ms-hpa
+  namespace: {{.Values.namespace}}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: core-subscriptions-ms
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: core-subscriptions-ms-pdb
+  namespace: {{.Values.namespace}}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: core-subscriptions-ms
