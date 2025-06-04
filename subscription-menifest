@@ -31,42 +31,36 @@ spec:
               echo "🚀 Smart migration check for core-subscriptions-ms..."
               echo "Version: {{.Values.core_subscriptions_ms.version}}"
               
-              # Method 1: Check if migrations are up to date using your migration tool
+              # Check current migration status using the correct script
               echo "🔍 Checking migration status..."
+              MIGRATION_OUTPUT=$(npm run subscriptions:migration:show 2>&1)
               
-              # Most migration tools have a way to check if migrations are up to date
-              # Adjust this command based on your specific migration tool
-              if npm run subscriptions:migration:status 2>/dev/null | grep -qi "up.to.date\|current\|no.pending\|already.applied\|nothing.to.migrate"; then
-                echo "✅ Database migrations are up to date"
-                echo "🔄 Skipping migration - this is likely a pod restart/scale"
-                exit 0
-              fi
+              echo "📊 Current migration status:"
+              echo "$MIGRATION_OUTPUT"
               
-              # Method 2: Check for pending migrations
-              echo "🔍 Checking for pending migrations..."
+              # Check if there are pending migrations
+              # TypeORM migration:show shows:
+              # [X] AppliedMigration  
+              # [ ] PendingMigration
               
-              # Try to list pending migrations (adjust command as needed)
-              PENDING=$(npm run subscriptions:migration:pending 2>/dev/null || echo "")
-              
-              if [ -z "$PENDING" ] || echo "$PENDING" | grep -qi "no.pending\|up.to.date\|none"; then
+              if echo "$MIGRATION_OUTPUT" | grep -q "\[ \]"; then
+                echo "🆕 Pending migrations detected - running migration..."
+                
+                # Run migration
+                npm run subscriptions:migration:up || {
+                  echo "❌ Migration failed!"
+                  exit 1
+                }
+                
+                echo "✅ Migration completed! Final status:"
+                npm run subscriptions:migration:show || echo "Could not verify status"
+                
+              else
                 echo "✅ No pending migrations found"
                 echo "🔄 Skipping migration - database is current"
-                exit 0
               fi
               
-              echo "🆕 Pending migrations detected - running migration..."
-              
-              # Run migration
-              npm run subscriptions:migration:up || {
-                echo "❌ Migration failed!"
-                exit 1
-              }
-              
-              # Verify migration completed
-              echo "✅ Migration completed! Verifying..."
-              npm run subscriptions:migration:status || echo "⚠️ Could not verify status"
-              
-              echo "🎉 Migration process finished successfully!"
+              echo "🎉 Migration process completed!"
           env:
             - name: NODE_OPTIONS
               value: "--max-old-space-size=2048"
