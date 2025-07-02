@@ -1,0 +1,230 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-users-ms
+  namespace: {{.Values.namespace}}
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: core-users-ms
+  replicas: {{.Values.replicas}}
+  template:
+    metadata:
+      namespace: {{.Values.namespace}}
+      labels:
+        app: core-users-ms
+    spec:
+      # INIT CONTAINER SECTION START
+      initContainers:
+        - name: run-migration
+          image: {{.Values.core_users_ms.image}}
+          command:
+            - sh
+            - -c
+            - |
+              echo "Smart migration check for core-users-ms..."
+              echo "Version: {{.Values.core_users_ms.version}}"
+              
+              # Check current migration status using the correct script
+              echo "Checking migration status..."
+              MIGRATION_OUTPUT=$(npm run users:migration:show 2>&1)
+              
+              echo "Current migration status:"
+              echo "$MIGRATION_OUTPUT"
+              
+              # Check if there are pending migrations
+              # TypeORM migration:show shows:
+              # [X] AppliedMigration  
+              # [ ] PendingMigration
+              
+              if echo "$MIGRATION_OUTPUT" | grep -q "\[ \]"; then
+                echo "Pending migrations detected - running migration..."
+                
+                # Run migration
+                npm run users:migration:up || {
+                  echo "Migration failed!"
+                  exit 1
+                }
+                
+                echo "Migration completed! Final status:"
+                npm run users:migration:show || echo "Could not verify status"
+                
+              else
+                echo "No pending migrations found"
+                echo "Skipping migration - database is current"
+              fi
+              
+              echo "Migration process completed!"
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=2048"
+          envFrom:
+            - configMapRef:
+                name: common-configmap
+            - configMapRef:
+                name: core-users-ms-configmap
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              memory: "3Gi"
+              cpu: "1500m"
+      #  END OF NEW INIT CONTAINER SECTION
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+      - maxSkew: 2
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: core-users-ms
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - core-users-ms
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: core-users-ms
+          env:
+            - name: "AWS_TEST_ACCESS_KEY_ID"
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_TEST_ACCESS_KEY_ID
+                  name: secrets
+            - name: "AWS_TEST_SECRET_ACCESS_KEY"
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_TEST_SECRET_ACCESS_KEY
+                  name: secrets
+            - name: "PREFIX"
+              value: "core-events"
+          envFrom:
+            - configMapRef:
+                name: common-configmap
+            - configMapRef:
+                name: core-users-ms-configmap
+          image: {{.Values.core_users_ms.image}}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "3Gi"
+              cpu: "750m"                   
+          # # startup probe
+          # startupProbe:
+          #   httpGet:
+          #     path: /users/healthcheck
+          #     port: 80
+          #   periodSeconds: 5
+          #   failureThreshold: 12
+          #   timeoutSeconds: 10
+          # liveness probe
+          livenessProbe:
+            httpGet:
+              path: /users/healthcheck
+              port: 80
+            initialDelaySeconds: 30
+            timeoutSeconds: 10
+            periodSeconds: 30
+            failureThreshold: 6
+          # readiness probe
+          readinessProbe:
+            httpGet:
+              path: /users/healthcheck
+              port: 80
+            initialDelaySeconds: 15
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 15"]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{.Values.namespace}}
+  name: core-users-ms
+spec:
+  selector:
+    app: core-users-ms
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+  type: NodePort
+---              
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: core-users-ms-hpa
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: core-users-ms
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 55
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 1                 # Scale by 1 pods at a time
+          periodSeconds: 20         ## Every 20 seconds
+      #   - type: Percent
+      #     value: 100                # Double the pods
+      #     periodSeconds: 30        # Every 30 seconds
+      # selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: core-users-ms-pdb
+  namespace: {{.Values.namespace}}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: core-users-ms
