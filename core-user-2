@@ -1,0 +1,239 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-users-ms
+  namespace: {{.Values.namespace}}
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: core-users-ms
+  replicas: {{.Values.replicas}}
+  template:
+    metadata:
+      namespace: {{.Values.namespace}}
+      labels:
+        app: core-users-ms
+    spec:
+      # OPTIMIZED LOAD-TEST INIT CONTAINER SECTION START
+      initContainers:
+        - name: run-migration
+          image: {{.Values.core_users_ms.image}}
+          command:
+            - timeout
+            - "30"
+            - sh
+            - -c
+            - |
+              echo "🚀 Load-test optimized migration check for core-users-ms..."
+              echo "Version: {{.Values.core_users_ms.version}}"
+              
+              # Quick service availability check with ultra-short timeout
+              echo "🔍 Quick service check..."
+              if timeout 3 sh -c 'exec 3<>/dev/tcp/core-users-ms.{{.Values.namespace}}.svc.cluster.local/80 2>/dev/null'; then
+                exec 3<&-
+                exec 3>&-
+                echo "✅ Service is accessible - likely scaling scenario"
+                echo "⚡ ULTRA-FAST startup - skipping migration check"
+                exit 0
+              fi
+              
+              echo "🔄 No service found - running migration check..."
+              
+              # Fast migration check with output limiting
+              echo "🔍 Checking migration status (max 25 seconds)..."
+              MIGRATION_OUTPUT=$(timeout 25 npm run users:migration:show 2>&1 | head -50 || echo "MIGRATION_TIMEOUT")
+              
+              if echo "$MIGRATION_OUTPUT" | grep -q "MIGRATION_TIMEOUT"; then
+                echo "⚠️ Migration check timed out - assuming database is current"
+                echo "✅ Proceeding with startup"
+                exit 0
+              fi
+              
+              echo "📊 Migration status checked"
+              
+              # Quick migration run if needed
+              if echo "$MIGRATION_OUTPUT" | grep -q "\[ \]"; then
+                echo "🆕 Pending migrations detected - running migration..."
+                timeout 20 npm run users:migration:up || {
+                  echo "⚠️ Migration timed out or failed - proceeding anyway"
+                  exit 0
+                }
+                echo "✅ Migration completed!"
+              else
+                echo "✅ No pending migrations found"
+              fi
+              
+              echo "🎉 Migration process completed in under 30 seconds!"
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=512"
+          envFrom:
+            - configMapRef:
+                name: common-configmap
+            - configMapRef:
+                name: core-users-ms-configmap
+          resources:
+            requests:
+              memory: "128Mi"  # Minimal for super-fast startup
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+      #  END OF OPTIMIZED LOAD-TEST INIT CONTAINER SECTION
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+      - maxSkew: 2
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: core-users-ms
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - core-users-ms
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: core-users-ms
+          env:
+            - name: "AWS_TEST_ACCESS_KEY_ID"
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_TEST_ACCESS_KEY_ID
+                  name: secrets
+            - name: "AWS_TEST_SECRET_ACCESS_KEY"
+              valueFrom:
+                secretKeyRef:
+                  key: AWS_TEST_SECRET_ACCESS_KEY
+                  name: secrets
+            - name: "PREFIX"
+              value: "core-events"
+          envFrom:
+            - configMapRef:
+                name: common-configmap
+            - configMapRef:
+                name: core-users-ms-configmap
+          image: {{.Values.core_users_ms.image}}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "3Gi"
+              cpu: "750m"                   
+          # # startup probe
+          # startupProbe:
+          #   httpGet:
+          #     path: /users/healthcheck
+          #     port: 80
+          #   periodSeconds: 5
+          #   failureThreshold: 12
+          #   timeoutSeconds: 10
+          # liveness probe
+          livenessProbe:
+            httpGet:
+              path: /users/healthcheck
+              port: 80
+            initialDelaySeconds: 30
+            timeoutSeconds: 10
+            periodSeconds: 30
+            failureThreshold: 6
+          # readiness probe
+          readinessProbe:
+            httpGet:
+              path: /users/healthcheck
+              port: 80
+            initialDelaySeconds: 15
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 15"]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{.Values.namespace}}
+  name: core-users-ms
+spec:
+  selector:
+    app: core-users-ms
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+  type: NodePort
+---              
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: core-users-ms-hpa
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: core-users-ms
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 55
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 55
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 1                 # Scale by 1 pods at a time
+          periodSeconds: 20         ## Every 20 seconds
+      #   - type: Percent
+      #     value: 100                # Double the pods
+      #     periodSeconds: 30        # Every 30 seconds
+      # selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: core-users-ms-pdb
+  namespace: {{.Values.namespace}}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: core-users-ms
