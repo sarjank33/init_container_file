@@ -19,8 +19,7 @@ spec:
       labels:
         app: core-subscriptions-ms
     spec:
-      ### serviceAccountName: migration-tracker  # ADD THIS LINE
-      # ONLY ADD THIS SECTION - everything else stays the same
+      # INIT CONTAINER SECTION START
       initContainers:
         - name: run-migration
           image: {{.Values.core_subscriptions_ms.image}}
@@ -76,7 +75,7 @@ spec:
             limits:
               memory: "3Gi"
               cpu: "1500m"
-      #  END OF NEW SECTION
+      #  END OF NEW INIT CONTAINER SECTION
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
