@@ -19,59 +19,56 @@ spec:
       labels:
         app: core-users-ms
     spec:
-      # OPTIMIZED LOAD-TEST INIT CONTAINER SECTION START
+# SIMPLE INIT CONTAINER WITH FAST SCALING START
       initContainers:
         - name: run-migration
           image: {{.Values.core_users_ms.image}}
           command:
-            - timeout
-            - "30"
             - sh
             - -c
             - |
-              echo "🚀 Load-test optimized migration check for core-users-ms..."
+              echo "🚀 Smart migration check for core-users-ms..."
               echo "Version: {{.Values.core_users_ms.version}}"
               
-              # Quick service availability check with ultra-short timeout
-              echo "🔍 Quick service check..."
-              if timeout 3 sh -c 'exec 3<>/dev/tcp/core-users-ms.{{.Values.namespace}}.svc.cluster.local/80 2>/dev/null'; then
-                exec 3<&-
-                exec 3>&-
-                echo "✅ Service is accessible - likely scaling scenario"
-                echo "⚡ ULTRA-FAST startup - skipping migration check"
+              # Quick check: if other pods are running, skip migration (SIMPLE!)
+              if wget -q --spider --timeout=2 http://core-users-ms.{{.Values.namespace}}.svc.cluster.local/users/healthcheck 2>/dev/null; then
+                echo "✅ Service already running - skipping migration check"
+                echo "⚡ FAST startup - other pods already handled migrations"
                 exit 0
               fi
               
-              echo "🔄 No service found - running migration check..."
+              echo "🔍 No service found - checking migration status..."
+              MIGRATION_OUTPUT=$(npm run users:migration:show 2>&1)
               
-              # Fast migration check with output limiting
-              echo "🔍 Checking migration status (max 25 seconds)..."
-              MIGRATION_OUTPUT=$(timeout 25 npm run users:migration:show 2>&1 | head -50 || echo "MIGRATION_TIMEOUT")
+              echo "📊 Current migration status:"
+              echo "$MIGRATION_OUTPUT"
               
-              if echo "$MIGRATION_OUTPUT" | grep -q "MIGRATION_TIMEOUT"; then
-                echo "⚠️ Migration check timed out - assuming database is current"
-                echo "✅ Proceeding with startup"
-                exit 0
-              fi
+              # Check if there are pending migrations
+              # TypeORM migration:show shows:
+              # [X] AppliedMigration  
+              # [ ] PendingMigration
               
-              echo "📊 Migration status checked"
-              
-              # Quick migration run if needed
               if echo "$MIGRATION_OUTPUT" | grep -q "\[ \]"; then
                 echo "🆕 Pending migrations detected - running migration..."
-                timeout 20 npm run users:migration:up || {
-                  echo "⚠️ Migration timed out or failed - proceeding anyway"
-                  exit 0
+                
+                # Run migration
+                npm run users:migration:up || {
+                  echo "❌ Migration failed!"
+                  exit 1
                 }
-                echo "✅ Migration completed!"
+                
+                echo "✅ Migration completed! Final status:"
+                npm run users:migration:show || echo "Could not verify status"
+                
               else
                 echo "✅ No pending migrations found"
+                echo "🔄 Skipping migration - database is current"
               fi
               
-              echo "🎉 Migration process completed in under 30 seconds!"
+              echo "🎉 Migration process completed!"
           env:
             - name: NODE_OPTIONS
-              value: "--max-old-space-size=512"
+              value: "--max-old-space-size=2048"
           envFrom:
             - configMapRef:
                 name: common-configmap
@@ -79,12 +76,14 @@ spec:
                 name: core-users-ms-configmap
           resources:
             requests:
-              memory: "128Mi"  # Minimal for super-fast startup
-              cpu: "50m"
+              memory: "2Gi"
+              cpu: "1000m"
             limits:
-              memory: "256Mi"
-              cpu: "200m"
-      #  END OF OPTIMIZED LOAD-TEST INIT CONTAINER SECTION
+              memory: "3Gi"
+              cpu: "1500m"
+      #  END OF SIMPLE INIT CONTAINER WITH FAST SCALING
+
+
       terminationGracePeriodSeconds: 30
       topologySpreadConstraints:
       - maxSkew: 2
